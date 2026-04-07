@@ -1,13 +1,20 @@
 """
-inference.py -- Baseline SRE agent for the OpenEnv SRE Incident Investigation environment.
+inference.py — Baseline SRE agent for the OpenEnv SRE Incident Investigation environment.
+
+Follows the exact pattern from the contest sample inference script.
 
 Mandatory environment variables:
-    API_BASE_URL  -- The API endpoint for the LLM
-    MODEL_NAME    -- The model identifier to use for inference
-    HF_TOKEN      -- Your Hugging Face / API key (used as LLM API key)
-    ENV_BASE_URL  -- Running SRE environment URL (default: http://localhost:8000)
+    API_BASE_URL        The API endpoint for the LLM
+    MODEL_NAME          The model identifier to use for inference
+    HF_TOKEN            Your Hugging Face / API key (used as LLM API key)
+    LOCAL_IMAGE_NAME    Docker image name for the environment
+                        e.g. registry.hf.space/arjun4707-sre-env:latest
 
-STDOUT FORMAT (strictly followed for automated evaluation):
+Optional:
+    ENV_BASE_URL        Direct URL to running env server (skips Docker)
+                        e.g. http://localhost:8000 or https://arjun4707-sre-env.hf.space
+
+STDOUT FORMAT (strictly required by contest evaluator):
     [START] task=<task_name> env=sre_env model=<model_name>
     [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
     [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
@@ -22,42 +29,49 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
 import time
-import urllib.request
 from typing import Any, Dict, List, Optional
 
-# ── websocket-client (sync, no asyncio) ───────────────────────────────────
-try:
-    import websocket
-except ImportError:
-    print("Missing dependency. Run: pip install websocket-client", flush=True)
-    sys.exit(1)
+from openai import OpenAI
 
-# ── OpenAI client ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Import our typed SRE environment client
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from openai import OpenAI
-except ImportError:
-    print("Missing dependency. Run: pip install openai", flush=True)
+    from client import SREEnvClient
+    from models import SREAction, SREObservation
+except ImportError as e:
+    print(f"[DEBUG] Import error: {e}", flush=True)
+    print("[DEBUG] Make sure client.py and models.py are in the same directory.", flush=True)
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Config — read from environment variables (mandatory per contest rules)
+# Config — all from environment variables (mandatory per contest rules)
 # ---------------------------------------------------------------------------
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME   = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
-HF_TOKEN     = os.environ.get("HF_TOKEN",     "")
-ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "http://localhost:8000")
+API_BASE_URL     = os.getenv("API_BASE_URL",     "https://api.openai.com/v1")
+MODEL_NAME       = os.getenv("MODEL_NAME",       "gpt-4o-mini")
+HF_TOKEN         = os.getenv("HF_TOKEN",         "")
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
+ENV_BASE_URL     = os.getenv("ENV_BASE_URL",     "")
 
-# HF_TOKEN is the primary API key per contest rules.
-# Falls back to OPENAI_API_KEY for local dev convenience.
-API_KEY = HF_TOKEN or os.environ.get("OPENAI_API_KEY", "")
+# HF_TOKEN is the primary API key per contest rules
+API_KEY = HF_TOKEN or os.getenv("OPENAI_API_KEY", "")
 
-BENCHMARK    = "sre_env"
-ALL_TASK_IDS = ["sre-easy-001", "sre-medium-002", "sre-hard-003"]
+BENCHMARK             = "sre_env"
+MAX_STEPS             = 20
+SUCCESS_SCORE_THRESHOLD = 0.1
+
+ALL_TASKS = [
+    {"task_id": "sre-easy-001",   "difficulty": "easy"},
+    {"task_id": "sre-medium-002", "difficulty": "medium"},
+    {"task_id": "sre-hard-003",   "difficulty": "hard"},
+]
 
 # ---------------------------------------------------------------------------
 # Structured stdout logging — exact format required by contest evaluator
@@ -71,7 +85,7 @@ def log_step(step: int, action: str, reward: float,
              done: bool, error: Optional[str]) -> None:
     error_val  = error.replace("\n", " ")[:120] if error else "null"
     done_val   = str(done).lower()
-    action_str = action.replace("\n", " ").replace("\r", "")[:200]
+    action_str = str(action).replace("\n", " ").replace("\r", "")[:200]
     print(
         f"[STEP] step={step} action={action_str} "
         f"reward={reward:.2f} done={done_val} error={error_val}",
@@ -90,99 +104,7 @@ def log_end(success: bool, steps: int, score: float,
 
 
 # ---------------------------------------------------------------------------
-# Health check — wake HF Space if sleeping, retry until ready
-# ---------------------------------------------------------------------------
-
-def _wait_for_env(base_url: str, retries: int = 12, delay: int = 10) -> None:
-    """Ping /health until the server responds. Handles HF Space cold starts."""
-    health_url = base_url.rstrip("/") + "/health"
-    for attempt in range(1, retries + 1):
-        try:
-            with urllib.request.urlopen(health_url, timeout=15) as r:
-                if r.status == 200:
-                    print(f"[DEBUG] env ready ({base_url})", flush=True)
-                    return
-        except Exception as e:
-            print(f"[DEBUG] health check {attempt}/{retries}: {e}", flush=True)
-        if attempt < retries:
-            time.sleep(delay)
-    raise RuntimeError(
-        f"Environment at {base_url} did not become healthy after {retries} attempts."
-    )
-
-
-# ---------------------------------------------------------------------------
-# WebSocket session — ONE persistent connection per episode
-# ---------------------------------------------------------------------------
-# HTTP /reset and /step are stateless (fresh env per call).
-# WebSocket /ws maintains session across all steps — use it for the whole episode.
-
-def _ws_url(base_url: str) -> str:
-    """Convert http(s)://host:port  →  ws(s)://host:port/ws"""
-    url = base_url.rstrip("/")
-    if url.startswith("https://"):
-        url = "wss://" + url[len("https://"):]
-    elif url.startswith("http://"):
-        url = "ws://" + url[len("http://"):]
-    return url + "/ws"
-
-
-class SRESession:
-    """Persistent WebSocket session for one SRE episode."""
-
-    def __init__(self, base_url: str):
-        ws_url = _ws_url(base_url)
-        print(f"[DEBUG] connecting to {ws_url}", flush=True)
-        self._ws = websocket.create_connection(
-            ws_url,
-            timeout=30,
-            # HF Spaces requires these headers for WebSocket upgrades
-            header={"User-Agent": "openenv-inference/1.0"},
-        )
-        print("[DEBUG] WebSocket connected", flush=True)
-
-    def _unwrap(self, raw: str) -> Dict:
-        """Robustly unwrap WS response regardless of server version."""
-        resp = json.loads(raw)
-        # Standard format: {type: observation, data: {observation:{}, reward, done}}
-        if isinstance(resp, dict) and "data" in resp:
-            return resp["data"]
-        # Flat format (older servers): {observation:{}, reward, done}
-        return resp
-
-    def reset(self, task_id: Optional[str] = None,
-              difficulty: Optional[str] = None) -> Dict:
-        data: Dict[str, Any] = {}
-        if task_id:
-            data["task_id"] = task_id
-        if difficulty:
-            data["difficulty"] = difficulty
-        self._ws.send(json.dumps({"type": "reset", "data": data}))
-        return self._unwrap(self._ws.recv())
-
-    def step(self, action: Dict) -> Dict:
-        self._ws.send(json.dumps({"type": "step", "data": action}))
-        return self._unwrap(self._ws.recv())
-
-    def close(self):
-        try:
-            self._ws.send(json.dumps({"type": "close"}))
-        except Exception:
-            pass
-        try:
-            self._ws.close()
-        except Exception:
-            pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        self.close()
-
-
-# ---------------------------------------------------------------------------
-# OpenAI LLM
+# OpenAI LLM client
 # ---------------------------------------------------------------------------
 
 llm = OpenAI(api_key=API_KEY or "placeholder", base_url=API_BASE_URL)
@@ -200,7 +122,7 @@ AVAILABLE ACTIONS:
    "log_level": "ERROR",
    "time_window_minutes": 60}
 
-  {"action_type": "query_metrics", "metric_name": "<name>"}
+  {"action_type": "query_metrics", "metric_name": "<n>"}
   Metrics: error_rate, latency_p99, latency_p50, cpu_usage,
            memory_usage, db_connections, request_rate, cache_hit_rate
 
@@ -232,7 +154,7 @@ Output ONLY valid JSON."""
 
 
 def call_llm(messages: List[Dict]) -> str:
-    """Call LLM. Returns raw text or raises on error."""
+    """Call LLM via OpenAI client."""
     response = llm.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
@@ -260,18 +182,18 @@ def parse_action(text: str) -> Optional[Dict]:
     return None
 
 
-def format_obs(obs: Dict) -> str:
+def format_obs(obs: SREObservation) -> str:
     """Format observation into LLM-readable text."""
     parts = []
-    if obs.get("message"):
-        parts.append(f"[STATUS] {obs['message']}")
-    for a in obs.get("alerts", [])[:10]:
+    if obs.message:
+        parts.append(f"[STATUS] {obs.message}")
+    for a in (obs.alerts or [])[:10]:
         parts.append(
             f"[ALERT] [{a.get('severity','?').upper()}] "
             f"{a.get('alert_name')} @ {a.get('service')}: "
             f"{a.get('message')} [{a.get('status')}]"
         )
-    logs = obs.get("logs", [])
+    logs = obs.logs or []
     if logs:
         parts.append(f"[LOGS] {len(logs)} entries:")
         for e in logs[-30:]:
@@ -279,30 +201,49 @@ def format_obs(obs: Dict) -> str:
                 f"  {e.get('timestamp','')} [{e.get('level','?'):5}] "
                 f"{e.get('service','?')}: {e.get('message','')}"
             )
-    if obs.get("metrics"):
-        vals = ", ".join(str(p.get("value")) for p in obs["metrics"])
-        parts.append(f"[METRIC: {obs.get('metric_name','?')}] {vals}")
-    score = obs.get("grader_score")
-    if score is not None:
-        parts.append(f"\n[FINAL SCORE] {score:.4f} / 1.0")
-        bd = (obs.get("grader_breakdown") or {}).get("breakdown", {})
+    metrics = obs.metrics or []
+    if metrics:
+        vals = ", ".join(str(p.get("value")) for p in metrics)
+        parts.append(f"[METRIC: {obs.metric_name or '?'}] {vals}")
+    if obs.grader_score is not None:
+        parts.append(f"\n[FINAL SCORE] {obs.grader_score:.4f} / 1.0")
+        bd = (obs.grader_breakdown or {}).get("breakdown", {})
         for k, v in bd.items():
             if k != "correct_answers":
                 parts.append(f"  {k}: {v.get('score',0):.2f} (w={v.get('weight',0):.2f})")
-    parts.append(f"\n[BUDGET] {obs.get('queries_remaining','?')} queries remaining")
+    parts.append(f"\n[BUDGET] {obs.queries_remaining} queries remaining")
     return "\n".join(parts)
 
 
+def action_to_repr(action_dict: Dict) -> str:
+    """Short string repr of action for [STEP] log."""
+    atype = action_dict.get("action_type", "unknown")
+    if atype == "query_logs":
+        return (f"query_logs(service={action_dict.get('service')},"
+                f"level={action_dict.get('log_level')})")
+    elif atype == "query_metrics":
+        return f"query_metrics(metric={action_dict.get('metric_name')})"
+    elif atype == "query_alerts":
+        return "query_alerts()"
+    elif atype == "annotate":
+        return f"annotate(note={str(action_dict.get('note',''))[:40]})"
+    elif atype == "submit":
+        return (f"submit(root={action_dict.get('root_cause_service')},"
+                f"type={action_dict.get('root_cause_type')})")
+    return atype
+
+
 # ---------------------------------------------------------------------------
-# Single episode
+# Single episode — async, matches contest sample pattern
 # ---------------------------------------------------------------------------
 
-def run_episode(task_id: Optional[str] = None,
-                difficulty: Optional[str] = None) -> Dict:
+async def run_episode(
+    task_id: Optional[str] = None,
+    difficulty: Optional[str] = None,
+) -> Dict:
     """
-    Run one full SRE episode.
-    Always emits [START], [STEP]*n, [END] to stdout.
-    Returns result dict.
+    Run one full SRE episode using the OpenEnv async client.
+    Always emits [START], [STEP]*n, [END].
     """
     task_label   = task_id or difficulty or "random"
     rewards:     List[float] = []
@@ -312,82 +253,87 @@ def run_episode(task_id: Optional[str] = None,
 
     log_start(task=task_label, env=BENCHMARK, model=MODEL_NAME)
 
+    env = None
     try:
-        _wait_for_env(ENV_BASE_URL)
+        # Connect to environment — Docker image takes priority (contest runner),
+        # falls back to direct URL (local dev / HF Space URL)
+        if LOCAL_IMAGE_NAME:
+            print(f"[DEBUG] starting container from {LOCAL_IMAGE_NAME}", flush=True)
+            env = await SREEnvClient.from_docker_image(LOCAL_IMAGE_NAME)
+        elif ENV_BASE_URL:
+            print(f"[DEBUG] connecting to {ENV_BASE_URL}", flush=True)
+            env = SREEnvClient(base_url=ENV_BASE_URL)
+            await env.connect()
+        else:
+            raise RuntimeError(
+                "Set LOCAL_IMAGE_NAME (Docker) or ENV_BASE_URL (direct URL)"
+            )
 
-        with SRESession(ENV_BASE_URL) as env:
-            resp = env.reset(task_id=task_id, difficulty=difficulty)
-            # Defensive unwrap — handle any nesting the server returns
-            if "data" in resp and "observation" in resp["data"]:
-                resp = resp["data"]
-            obs  = resp.get("observation", resp)
+        # Reset
+        reset_kwargs: Dict[str, Any] = {}
+        if task_id:
+            reset_kwargs["task_id"] = task_id
+        if difficulty:
+            reset_kwargs["difficulty"] = difficulty
 
-            messages: List[Dict] = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": format_obs(obs)},
-            ]
+        result = await env.reset(**reset_kwargs)
+        obs    = result.observation
 
-            for step in range(1, 21):
-                steps_taken = step
-                error_msg: Optional[str] = None
-                action_repr = "error"
+        messages: List[Dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": format_obs(obs)},
+        ]
 
-                try:
-                    action_text = call_llm(messages)
-                    action_dict = parse_action(action_text)
-                    if action_dict is None:
-                        error_msg   = f"parse_failed"
-                        action_dict = {
-                            "action_type": "submit",
-                            "root_cause_service": "",
-                            "root_cause_type": "",
-                            "confidence": 0.0,
-                        }
-                except Exception as e:
-                    error_msg   = f"llm_error:{str(e)[:80]}"
-                    action_text = "{}"
+        for step in range(1, MAX_STEPS + 1):
+            if result.done:
+                break
+
+            steps_taken  = step
+            error_msg: Optional[str] = None
+            action_repr  = "error"
+
+            try:
+                action_text = call_llm(messages)
+                action_dict = parse_action(action_text)
+                if action_dict is None:
+                    error_msg   = "parse_failed"
                     action_dict = {
                         "action_type": "submit",
                         "root_cause_service": "",
                         "root_cause_type": "",
                         "confidence": 0.0,
                     }
+            except Exception as e:
+                error_msg   = f"llm_error:{str(e)[:80]}"
+                action_text = "{}"
+                action_dict = {
+                    "action_type": "submit",
+                    "root_cause_service": "",
+                    "root_cause_type": "",
+                    "confidence": 0.0,
+                }
 
-                # Build action repr for [STEP] log
-                atype = action_dict.get("action_type", "unknown")
-                if atype == "query_logs":
-                    action_repr = (f"query_logs(service={action_dict.get('service')},"
-                                   f"level={action_dict.get('log_level')})")
-                elif atype == "query_metrics":
-                    action_repr = f"query_metrics(metric={action_dict.get('metric_name')})"
-                elif atype == "query_alerts":
-                    action_repr = "query_alerts()"
-                elif atype == "annotate":
-                    action_repr = f"annotate(note={str(action_dict.get('note',''))[:40]})"
-                elif atype == "submit":
-                    action_repr = (f"submit(root={action_dict.get('root_cause_service')},"
-                                   f"type={action_dict.get('root_cause_type')})")
-                else:
-                    action_repr = atype
+            action_repr = action_to_repr(action_dict)
 
-                # Step the environment
-                resp   = env.step(action_dict)
-                if "data" in resp and "observation" in resp["data"]:
-                    resp = resp["data"]
-                obs    = resp.get("observation", resp)
-                done   = resp.get("done", False)
-                reward = float(resp.get("reward") or 0.0)
+            # Step environment using typed SREAction
+            sre_action = SREAction(**action_dict)
+            result     = await env.step(sre_action)
+            obs        = result.observation
+            done       = result.done
+            reward     = float(result.reward or 0.0)
 
-                rewards.append(reward)
-                log_step(step=step, action=action_repr, reward=reward,
-                         done=done, error=error_msg)
+            rewards.append(reward)
 
-                messages.append({"role": "assistant", "content": action_text})
-                messages.append({"role": "user",      "content": format_obs(obs)})
+            # Emit [STEP] immediately after env.step() returns (contest rule)
+            log_step(step=step, action=action_repr, reward=reward,
+                     done=done, error=error_msg)
 
-                if done:
-                    final_score = float(obs.get("grader_score") or reward or 0.0)
-                    break
+            messages.append({"role": "assistant", "content": action_text})
+            messages.append({"role": "user",      "content": format_obs(obs)})
+
+            if done:
+                final_score = float(obs.grader_score or reward or 0.0)
+                break
 
     except Exception as e:
         error_str = str(e)
@@ -398,10 +344,21 @@ def run_episode(task_id: Optional[str] = None,
                  reward=0.0, done=True, error=error_str[:120])
 
     finally:
+        # Always close env (contest rule: [END] emitted after env.close())
+        if env is not None:
+            try:
+                await env.close()
+            except Exception as e:
+                print(f"[DEBUG] env.close() error: {e}", flush=True)
+
         final_score = min(max(final_score, 0.0), 1.0)
-        success     = final_score >= 0.1
-        log_end(success=success, steps=max(steps_taken, 1),
-                score=final_score, rewards=rewards if rewards else [0.0])
+        success     = final_score >= SUCCESS_SCORE_THRESHOLD
+        log_end(
+            success=success,
+            steps=max(steps_taken, 1),
+            score=final_score,
+            rewards=rewards if rewards else [0.0],
+        )
 
     return {
         "task_id":     task_label,
@@ -416,28 +373,30 @@ def run_episode(task_id: Optional[str] = None,
 # Multi-task runner
 # ---------------------------------------------------------------------------
 
-def run_all_tasks() -> None:
+async def run_all_tasks() -> None:
     results = []
-    configs = [
-        {"task_id": "sre-easy-001",   "difficulty": "easy"},
-        {"task_id": "sre-medium-002", "difficulty": "medium"},
-        {"task_id": "sre-hard-003",   "difficulty": "hard"},
-    ]
-    for cfg in configs:
+    for cfg in ALL_TASKS:
         try:
-            r = run_episode(task_id=cfg["task_id"], difficulty=cfg["difficulty"])
+            r = await run_episode(
+                task_id=cfg["task_id"],
+                difficulty=cfg["difficulty"],
+            )
             results.append(r)
         except Exception as e:
             print(f"[DEBUG] ERROR {cfg['task_id']}: {e}", flush=True)
-            results.append({**cfg, "final_score": 0.0, "steps": 0,
-                            "success": False, "error": str(e)})
-        time.sleep(2)
+            results.append({
+                **cfg, "final_score": 0.0,
+                "steps": 0, "success": False, "error": str(e),
+            })
+        await asyncio.sleep(2)
 
     avg = sum(r.get("final_score", 0) for r in results) / len(results) if results else 0
     print(f"\n[SUMMARY] average_score={avg:.4f} model={MODEL_NAME}", flush=True)
     print(json.dumps({
-        "model": MODEL_NAME, "env_url": ENV_BASE_URL,
-        "results": results, "average_score": round(avg, 4),
+        "model": MODEL_NAME,
+        "image": LOCAL_IMAGE_NAME or ENV_BASE_URL,
+        "results": results,
+        "average_score": round(avg, 4),
     }, indent=2), flush=True)
 
 
@@ -447,7 +406,7 @@ def run_all_tasks() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SRE Incident Investigation -- Baseline Inference"
+        description="SRE Incident Investigation — Baseline Inference"
     )
     parser.add_argument("--task",       type=str, default=None)
     parser.add_argument("--difficulty", type=str, default=None,
@@ -456,6 +415,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.task or args.difficulty:
-        run_episode(task_id=args.task, difficulty=args.difficulty)
+        asyncio.run(run_episode(task_id=args.task, difficulty=args.difficulty))
     else:
-        run_all_tasks()
+        asyncio.run(run_all_tasks())
