@@ -141,6 +141,15 @@ class SRESession:
         )
         print("[DEBUG] WebSocket connected", flush=True)
 
+    def _unwrap(self, raw: str) -> Dict:
+        """Robustly unwrap WS response regardless of server version."""
+        resp = json.loads(raw)
+        # Standard format: {type: observation, data: {observation:{}, reward, done}}
+        if isinstance(resp, dict) and "data" in resp:
+            return resp["data"]
+        # Flat format (older servers): {observation:{}, reward, done}
+        return resp
+
     def reset(self, task_id: Optional[str] = None,
               difficulty: Optional[str] = None) -> Dict:
         data: Dict[str, Any] = {}
@@ -149,13 +158,11 @@ class SRESession:
         if difficulty:
             data["difficulty"] = difficulty
         self._ws.send(json.dumps({"type": "reset", "data": data}))
-        resp = json.loads(self._ws.recv())
-        return resp["data"]   # {"observation": {...}, "reward": ..., "done": ...}
+        return self._unwrap(self._ws.recv())
 
     def step(self, action: Dict) -> Dict:
         self._ws.send(json.dumps({"type": "step", "data": action}))
-        resp = json.loads(self._ws.recv())
-        return resp["data"]
+        return self._unwrap(self._ws.recv())
 
     def close(self):
         try:
@@ -310,7 +317,10 @@ def run_episode(task_id: Optional[str] = None,
 
         with SRESession(ENV_BASE_URL) as env:
             resp = env.reset(task_id=task_id, difficulty=difficulty)
-            obs  = resp["observation"]
+            # Defensive unwrap — handle any nesting the server returns
+            if "data" in resp and "observation" in resp["data"]:
+                resp = resp["data"]
+            obs  = resp.get("observation", resp)
 
             messages: List[Dict] = [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -362,7 +372,9 @@ def run_episode(task_id: Optional[str] = None,
 
                 # Step the environment
                 resp   = env.step(action_dict)
-                obs    = resp["observation"]
+                if "data" in resp and "observation" in resp["data"]:
+                    resp = resp["data"]
+                obs    = resp.get("observation", resp)
                 done   = resp.get("done", False)
                 reward = float(resp.get("reward") or 0.0)
 
