@@ -350,7 +350,7 @@ async def run_episode(
             except Exception as e:
                 print(f"[DEBUG] env.close() error: {e}", flush=True)
 
-        final_score = min(max(final_score, 0.0), 1.0)
+        final_score = min(max(final_score, 0.001), 0.999)
         success     = final_score >= SUCCESS_SCORE_THRESHOLD
         log_end(
             success=success,
