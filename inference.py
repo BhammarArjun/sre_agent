@@ -58,7 +58,7 @@ except ImportError as e:
 # contest LiteLLM proxy. Do NOT hardcode keys or bypass with other providers.
 API_BASE_URL     = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
 MODEL_NAME       = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
-API_KEY          = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", "")
+API_KEY          = os.environ["API_KEY"]
 LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME", "")
 ENV_BASE_URL     = os.environ.get("ENV_BASE_URL",     "")
 
