@@ -54,14 +54,13 @@ except ImportError as e:
 # Config — all from environment variables (mandatory per contest rules)
 # ---------------------------------------------------------------------------
 
-API_BASE_URL     = os.getenv("API_BASE_URL",     "https://api.openai.com/v1")
-MODEL_NAME       = os.getenv("MODEL_NAME",       "gpt-4o-mini")
-HF_TOKEN         = os.getenv("HF_TOKEN",         "")
-LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "")
-ENV_BASE_URL     = os.getenv("ENV_BASE_URL",     "")
-
-# HF_TOKEN is the primary API key per contest rules
-API_KEY = HF_TOKEN or os.getenv("OPENAI_API_KEY", "")
+# IMPORTANT: Must use API_BASE_URL and API_KEY exactly as injected by the
+# contest LiteLLM proxy. Do NOT hardcode keys or bypass with other providers.
+API_BASE_URL     = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
+MODEL_NAME       = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
+API_KEY          = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN", "")
+LOCAL_IMAGE_NAME = os.environ.get("LOCAL_IMAGE_NAME", "")
+ENV_BASE_URL     = os.environ.get("ENV_BASE_URL",     "")
 
 BENCHMARK             = "sre_env"
 MAX_STEPS             = 20
@@ -107,7 +106,7 @@ def log_end(success: bool, steps: int, score: float,
 # OpenAI LLM client
 # ---------------------------------------------------------------------------
 
-llm = OpenAI(api_key=API_KEY or "placeholder", base_url=API_BASE_URL)
+llm = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) investigating a production incident.
 
